@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 class Predictor(BasePredictor):
+
+    def _init_compel(self, pipe):
+        self.compel_proc = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
+
     def setup(self):
         """Initialize the predictor."""
         self.model_pipes: Dict[str, Dict] = {}
@@ -181,8 +185,11 @@ class Predictor(BasePredictor):
         self,
         model: str = Input(description="Choose a model", choices=["stable-diffusion-v1-5", "realistic-vision-v5-1", "realistic-vision-v6-0b"], default="stable-diffusion-v1-5"),
         model_url: str = Input(description="URL to a custom model file (optional)", default=None),
-        prompt: str = Input(description="Input prompt"),
-        negative_prompt: str = Input(description="Negative prompt", default=None),
+        prompt: str = Input(description="Input prompt - using compel, use +++ to increase words weight"),
+        negative_prompt: str = Input(
+            description="Negative prompt - using compel, use +++ to increase words weight. Available negative embeddings: FastNegativeV2, boring_e621_v4, verybadimagenegative_v1, JuggernautNegative-neg",
+            default="Longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
+        ),
         width: int = Input(description="Width of output image", ge=64, le=2048, default=512),
         height: int = Input(description="Height of output image", ge=64, le=2048, default=512),
         num_outputs: int = Input(description="Number of images to output", ge=1, le=4, default=1),
@@ -221,7 +228,7 @@ class Predictor(BasePredictor):
         )
         
         return self._save_output_images(output.images)
-
+    
     def _get_scheduler(self, scheduler_name: str, config):
         """Get the specified scheduler."""
         schedulers = {
