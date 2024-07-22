@@ -187,13 +187,13 @@ class Predictor(BasePredictor):
         model_url: str = Input(description="URL to a custom model file (optional)", default=None),
         prompt: str = Input(description="Input prompt - using compel, use +++ to increase words weight"),
         negative_prompt: str = Input(
-            description="Negative prompt - using compel, use +++ to increase words weight. Available negative embeddings: FastNegativeV2, boring_e621_v4, verybadimagenegative_v1, JuggernautNegative-neg",
-            default="Longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
+            description="Negative prompt - using compel, use +++ to increase words weight.",
+            default="lowres, cropped, worst quality, low quality"
         ),
         width: int = Input(description="Width of output image", ge=64, le=2048, default=512),
         height: int = Input(description="Height of output image", ge=64, le=2048, default=512),
         num_outputs: int = Input(description="Number of images to output", ge=1, le=4, default=1),
-        num_inference_steps: int = Input(description="Number of denoising steps", ge=1, le=500, default=50),
+        num_inference_steps: int = Input(description="Number of denoising steps", ge=1, le=100, default=25),
         guidance_scale: float = Input(description="Scale for classifier-free guidance", ge=1, le=20, default=7.5),
         scheduler: str = Input(description="Choose a scheduler", choices=["DDIM", "Euler a", "DPM++ 2M Karras", "DPM++ 3M SDE Karras"], default="DPM++ 3M SDE Karras"),
         seed: int = Input(description="Random seed. Leave blank to randomize the seed", default=None),
