@@ -16,6 +16,7 @@ from diffusers import (
     AutoencoderKL,
     DPMSolverSDEScheduler
 )
+from compel import Compel
 from cog import BasePredictor, Input, Path
 import logging
 
@@ -51,8 +52,12 @@ class Predictor(BasePredictor):
             pipe = self._load_predefined_model(model_name)
 
         self._setup_pipeline(pipe)
+        self._init_compel(pipe)
         self.model_pipes[model_key] = {'pipe': pipe, 'last_used': time.time()}
         return pipe
+
+    def _init_compel(self, pipe):
+        self.compel_proc = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
 
     def _manage_model_cache(self):
         """Manage the model cache to ensure it doesn't exceed the maximum size."""
@@ -200,9 +205,13 @@ class Predictor(BasePredictor):
         pipe.scheduler = self._get_scheduler(scheduler, pipe.scheduler.config)
         generator = torch.Generator(DEVICE).manual_seed(seed)
 
+        # Process prompts with Compel
+        prompt_embeds = self.compel_proc(prompt)
+        negative_prompt_embeds = self.compel_proc(negative_prompt) if negative_prompt else None
+
         output = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
             width=width,
             height=height,
             num_inference_steps=num_inference_steps,

@@ -14,5 +14,6 @@ build:
     - "torchsde==0.2.6"
     - "requests==2.31.0"
     - "omegaconf==2.3.0"
+    - "compel==2.0.1"  # Add this line
 
 predict: "predict.py:Predictor"
