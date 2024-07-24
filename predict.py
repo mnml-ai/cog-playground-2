@@ -16,6 +16,7 @@ from diffusers import (
     AutoencoderKL,
     DPMSolverSDEScheduler
 )
+from diffusers import MultiDiffusion
 from compel import Compel
 from cog import BasePredictor, Input, Path
 import logging
@@ -31,6 +32,16 @@ logger = logging.getLogger(__name__)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 class Predictor(BasePredictor):
+
+    def enhance_with_multi_diffusion(self, pipe, image, prompt, num_inference_steps=20):
+        multi_diffusion = MultiDiffusion(pipe)
+        enhanced_image = multi_diffusion(
+            prompt=prompt,
+            image=image,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=7.5,
+        ).images[0]
+        return enhanced_image
 
     def _init_compel(self, pipe):
         self.compel_proc = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
@@ -197,6 +208,8 @@ class Predictor(BasePredictor):
         guidance_scale: float = Input(description="Scale for classifier-free guidance", ge=1, le=20, default=7.5),
         scheduler: str = Input(description="Choose a scheduler", choices=["DDIM", "Euler a", "DPM++ 2M Karras", "DPM++ 3M SDE Karras"], default="DPM++ 3M SDE Karras"),
         seed: int = Input(description="Random seed. Leave blank to randomize the seed", default=None),
+        use_multi_diffusion: bool = Input(description="Use multi-diffusion for enhancement", default=True),
+        multi_diffusion_steps: int = Input(description="Number of multi-diffusion steps", ge=1, le=50, default=20),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         pipe = self.load_model(model, model_url)
@@ -227,7 +240,14 @@ class Predictor(BasePredictor):
             generator=generator,
         )
         
-        return self._save_output_images(output.images)
+        if use_multi_diffusion:
+            enhanced_images = []
+            for image in output.images:
+                enhanced_image = self.enhance_with_multi_diffusion(pipe, image, prompt, multi_diffusion_steps)
+                enhanced_images.append(enhanced_image)
+            return self._save_output_images(enhanced_images)
+        else:
+            return self._save_output_images(output.images)
     
     def _get_scheduler(self, scheduler_name: str, config):
         """Get the specified scheduler."""
