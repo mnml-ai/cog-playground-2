@@ -14,11 +14,12 @@ from diffusers import (
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
     AutoencoderKL,
-    DPMSolverSDEScheduler
+    DPMSolverSDEScheduler,
+    StableDiffusionControlNetPipeline,
+    ControlNetModel,
 )
 
-from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
-from controlnet_aux import OpenposeDetector, MidasDetector
+from controlnet_aux import OpenposeDetector, MidasDetector, HEDdetector, MLSDdetector, CannyDetector, LineartDetector
 from PIL import Image
 import io
 
@@ -43,7 +44,14 @@ class Predictor(BasePredictor):
         self.model_pipes: Dict[str, Dict] = {}
         self.controlnet_models: Dict[str, ControlNetModel] = {}
         os.makedirs(MODEL_CACHE, exist_ok=True)
-        self.depth_detector = MidasDetector.from_pretrained("lllyasviel/ControlNet")
+        self.controlnet_detectors = {
+            "depth": MidasDetector.from_pretrained("lllyasviel/ControlNet"),
+            "openpose": OpenposeDetector.from_pretrained("lllyasviel/ControlNet"),
+            "hed": HEDdetector.from_pretrained("lllyasviel/ControlNet"),
+            "mlsd": MLSDdetector.from_pretrained("lllyasviel/ControlNet"),
+            "canny": CannyDetector.from_pretrained("lllyasviel/ControlNet"),
+            "lineart": LineartDetector.from_pretrained("lllyasviel/ControlNet"),
+        }
 
     def load_model(self, model_name: str, model_url: str = None):
         """Load a specific model if it's not already loaded."""
@@ -63,9 +71,6 @@ class Predictor(BasePredictor):
         self._setup_pipeline(pipe)
         self._init_compel(pipe)
         self.model_pipes[model_key] = {'pipe': pipe, 'last_used': time.time()}
-        
-        # Load ControlNet model
-        self._load_controlnet_model("depth")
         
         return pipe
 
@@ -199,6 +204,18 @@ class Predictor(BasePredictor):
             ).to(DEVICE)
             self.controlnet_models[controlnet_type] = controlnet
 
+    def resize_image(self, image, max_width, max_height):
+        """Resize image while maintaining aspect ratio."""
+        width, height = image.size
+        aspect_ratio = width / height
+        if width > max_width:
+            width = max_width
+            height = int(width / aspect_ratio)
+        if height > max_height:
+            height = max_height
+            width = int(height * aspect_ratio)
+        return image.resize((width, height), Image.LANCZOS)
+
     @torch.inference_mode()
     def predict(
         self,
@@ -216,8 +233,9 @@ class Predictor(BasePredictor):
         guidance_scale: float = Input(description="Scale for classifier-free guidance", ge=1, le=20, default=7.5),
         scheduler: str = Input(description="Choose a scheduler", choices=["DDIM", "Euler a", "DPM++ 2M Karras", "DPM++ 3M SDE Karras"], default="DPM++ 3M SDE Karras"),
         seed: int = Input(description="Random seed. Leave blank to randomize the seed", default=None),
-        use_depth_controlnet: bool = Input(description="Use depth ControlNet", default=False),
-        depth_image: Path = Input(description="Input image for depth ControlNet", default=None),
+        use_controlnet: bool = Input(description="Use ControlNet", default=False),
+        controlnet_type: str = Input(description="ControlNet type", choices=["depth", "canny", "mlsd", "hed", "openpose", "lineart"], default="depth"),
+        controlnet_image: Path = Input(description="Input image for ControlNet", default=None),
         controlnet_conditioning_scale: float = Input(description="ControlNet conditioning scale", ge=0.0, le=1.0, default=0.5),
     ) -> List[Path]:
         """Run a single prediction on the model"""
@@ -238,10 +256,14 @@ class Predictor(BasePredictor):
         prompt_embeds = self.compel_proc(prompt)
         negative_prompt_embeds = self.compel_proc(negative_prompt) if negative_prompt else None
 
-        if use_depth_controlnet and depth_image:
-            # Load and process the depth image
-            depth_image = Image.open(depth_image).convert("RGB")
-            depth_image = self.depth_detector(depth_image)
+        if use_controlnet and controlnet_image:
+            # Load and process the controlnet image
+            control_image = Image.open(controlnet_image).convert("RGB")
+            control_image = self.resize_image(control_image, width, height)
+            processed_image = self.controlnet_detectors[controlnet_type](control_image)
+            
+            # Load ControlNet model
+            self._load_controlnet_model(controlnet_type)
             
             # Create ControlNet pipeline
             controlnet_pipe = StableDiffusionControlNetPipeline(
@@ -252,13 +274,13 @@ class Predictor(BasePredictor):
                 scheduler=pipe.scheduler,
                 safety_checker=pipe.safety_checker,
                 feature_extractor=pipe.feature_extractor,
-                controlnet=self.controlnet_models["depth"]
+                controlnet=self.controlnet_models[controlnet_type]
             ).to(DEVICE)
 
             output = controlnet_pipe(
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
-                image=depth_image,
+                image=processed_image,
                 width=width,
                 height=height,
                 num_inference_steps=num_inference_steps,
