@@ -15,6 +15,5 @@ build:
     - "requests==2.31.0"
     - "omegaconf==2.3.0"
     - "compel==2.0.1"
-    - "multidiffusion==0.1.0"  # Add this line
 
 predict: "predict.py:Predictor"

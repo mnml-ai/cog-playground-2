@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional
 import requests
 from urllib.parse import urlparse
 
@@ -9,14 +9,13 @@ import torch
 import numpy as np
 import random
 from diffusers import (
-    StableDiffusionPipeline,
+    StableDiffusionPanoramaPipeline,
     DDIMScheduler,
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
     AutoencoderKL,
     DPMSolverSDEScheduler
 )
-from diffusers import MultiDiffusion
 from compel import Compel
 from cog import BasePredictor, Input, Path
 import logging
@@ -32,19 +31,6 @@ logger = logging.getLogger(__name__)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 class Predictor(BasePredictor):
-
-    def enhance_with_multi_diffusion(self, pipe, image, prompt, num_inference_steps=20):
-        multi_diffusion = MultiDiffusion(pipe)
-        enhanced_image = multi_diffusion(
-            prompt=prompt,
-            image=image,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=7.5,
-        ).images[0]
-        return enhanced_image
-
-    def _init_compel(self, pipe):
-        self.compel_proc = Compel(tokenizer=pipe.tokenizer, text_encoder=pipe.text_encoder)
 
     def setup(self):
         """Initialize the predictor."""
@@ -86,7 +72,7 @@ class Predictor(BasePredictor):
         model_path = self._download_model(model_url)
         logger.info(f"Loading custom model from {model_path}")
         try:
-            return StableDiffusionPipeline.from_single_file(
+            return StableDiffusionPanoramaPipeline.from_single_file(
                 model_path,
                 torch_dtype=torch.float16,
                 use_safetensors=True,
@@ -113,7 +99,7 @@ class Predictor(BasePredictor):
         model_id, custom_config = model_id_map[model_name]
         
         try:
-            return StableDiffusionPipeline.from_pretrained(
+            return StableDiffusionPanoramaPipeline.from_pretrained(
                 model_id,
                 torch_dtype=torch.float16,
                 use_safetensors=True,
@@ -124,7 +110,7 @@ class Predictor(BasePredictor):
         except Exception as e:
             logger.warning(f"Failed to load with safetensors: {e}")
             logger.info("Attempting to load with PyTorch weights...")
-            return StableDiffusionPipeline.from_pretrained(
+            return StableDiffusionPanoramaPipeline.from_pretrained(
                 model_id,
                 torch_dtype=torch.float16,
                 use_safetensors=False,
@@ -201,15 +187,15 @@ class Predictor(BasePredictor):
             description="Negative prompt - using compel, use +++ to increase words weight.",
             default="lowres, cropped, worst quality, low quality"
         ),
-        width: int = Input(description="Width of output image", ge=64, le=2048, default=512),
+        width: int = Input(description="Width of output image", ge=64, le=2048, default=2048),
         height: int = Input(description="Height of output image", ge=64, le=2048, default=512),
         num_outputs: int = Input(description="Number of images to output", ge=1, le=4, default=1),
-        num_inference_steps: int = Input(description="Number of denoising steps", ge=1, le=100, default=25),
+        num_inference_steps: int = Input(description="Number of denoising steps", ge=1, le=100, default=50),
         guidance_scale: float = Input(description="Scale for classifier-free guidance", ge=1, le=20, default=7.5),
         scheduler: str = Input(description="Choose a scheduler", choices=["DDIM", "Euler a", "DPM++ 2M Karras", "DPM++ 3M SDE Karras"], default="DPM++ 3M SDE Karras"),
         seed: int = Input(description="Random seed. Leave blank to randomize the seed", default=None),
-        use_multi_diffusion: bool = Input(description="Use multi-diffusion for enhancement", default=True),
-        multi_diffusion_steps: int = Input(description="Number of multi-diffusion steps", ge=1, le=50, default=20),
+        view_batch_size: int = Input(description="Batch size for denoising split views", ge=1, le=8, default=1),
+        circular_padding: bool = Input(description="Use circular padding for seamless panoramas", default=True),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         pipe = self.load_model(model, model_url)
@@ -238,16 +224,11 @@ class Predictor(BasePredictor):
             guidance_scale=guidance_scale,
             num_images_per_prompt=num_outputs,
             generator=generator,
+            view_batch_size=view_batch_size,
+            circular_padding=circular_padding,
         )
         
-        if use_multi_diffusion:
-            enhanced_images = []
-            for image in output.images:
-                enhanced_image = self.enhance_with_multi_diffusion(pipe, image, prompt, multi_diffusion_steps)
-                enhanced_images.append(enhanced_image)
-            return self._save_output_images(enhanced_images)
-        else:
-            return self._save_output_images(output.images)
+        return self._save_output_images(output.images)
     
     def _get_scheduler(self, scheduler_name: str, config):
         """Get the specified scheduler."""
