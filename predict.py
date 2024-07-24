@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict
 import requests
 from urllib.parse import urlparse
 
@@ -16,6 +16,12 @@ from diffusers import (
     AutoencoderKL,
     DPMSolverSDEScheduler
 )
+
+from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
+from controlnet_aux import OpenposeDetector, MidasDetector
+from PIL import Image
+import io
+
 from compel import Compel
 from cog import BasePredictor, Input, Path
 import logging
@@ -31,10 +37,13 @@ logger = logging.getLogger(__name__)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 class Predictor(BasePredictor):
+
     def setup(self):
         """Initialize the predictor."""
         self.model_pipes: Dict[str, Dict] = {}
+        self.controlnet_models: Dict[str, ControlNetModel] = {}
         os.makedirs(MODEL_CACHE, exist_ok=True)
+        self.depth_detector = MidasDetector.from_pretrained("lllyasviel/ControlNet")
 
     def load_model(self, model_name: str, model_url: str = None):
         """Load a specific model if it's not already loaded."""
@@ -54,6 +63,10 @@ class Predictor(BasePredictor):
         self._setup_pipeline(pipe)
         self._init_compel(pipe)
         self.model_pipes[model_key] = {'pipe': pipe, 'last_used': time.time()}
+        
+        # Load ControlNet model
+        self._load_controlnet_model("depth")
+        
         return pipe
 
     def _init_compel(self, pipe):
@@ -176,50 +189,15 @@ class Predictor(BasePredictor):
         np.random.seed(seed)
         random.seed(seed)
 
-    def _get_views(self, height: int, width: int, window_size: int = 64, stride: int = 8):
-        """Generate views for MultiDiffusion."""
-        views = []
-        for h in range(0, height - window_size + 1, stride):
-            for w in range(0, width - window_size + 1, stride):
-                views.append((h, w, h + window_size, w + window_size))
-        return views
-
-    def _multi_diffusion(self, pipe, latents, prompt_embeds, negative_prompt_embeds, num_inference_steps, guidance_scale, views):
-        """Apply MultiDiffusion technique."""
-        for step in pipe.progress_bar(pipe.scheduler.timesteps):
-            latent_model_input = pipe.scheduler.scale_model_input(latents, step)
-            noise_pred = torch.zeros_like(latents)
-            weights_sum = torch.zeros_like(latents)
-
-            for view in views:
-                h_start, w_start, h_end, w_end = view
-                latent_view = latent_model_input[:, :, h_start:h_end, w_start:w_end]
-                
-                noise_pred_view = pipe.unet(
-                    latent_view,
-                    step,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=None,
-                    return_dict=False,
-                )[0]
-
-                if guidance_scale > 1.0:
-                    uncond_noise_pred_view = pipe.unet(
-                        latent_view,
-                        step,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        cross_attention_kwargs=None,
-                        return_dict=False,
-                    )[0]
-                    noise_pred_view = uncond_noise_pred_view + guidance_scale * (noise_pred_view - uncond_noise_pred_view)
-
-                noise_pred[:, :, h_start:h_end, w_start:w_end] += noise_pred_view
-                weights_sum[:, :, h_start:h_end, w_start:w_end] += 1
-
-            noise_pred = noise_pred / weights_sum
-            latents = pipe.scheduler.step(noise_pred, step, latents, return_dict=False)[0]
-
-        return latents
+    def _load_controlnet_model(self, controlnet_type: str):
+        if controlnet_type not in self.controlnet_models:
+            logger.info(f"Loading ControlNet model for {controlnet_type}")
+            controlnet = ControlNetModel.from_pretrained(
+                f"lllyasviel/sd-controlnet-{controlnet_type}",
+                torch_dtype=torch.float16,
+                cache_dir=MODEL_CACHE
+            ).to(DEVICE)
+            self.controlnet_models[controlnet_type] = controlnet
 
     @torch.inference_mode()
     def predict(
@@ -234,13 +212,13 @@ class Predictor(BasePredictor):
         width: int = Input(description="Width of output image", ge=64, le=2048, default=512),
         height: int = Input(description="Height of output image", ge=64, le=2048, default=512),
         num_outputs: int = Input(description="Number of images to output", ge=1, le=4, default=1),
-        num_inference_steps: int = Input(description="Number of denoising steps", ge=1, le=100, default=50),
+        num_inference_steps: int = Input(description="Number of denoising steps", ge=1, le=100, default=25),
         guidance_scale: float = Input(description="Scale for classifier-free guidance", ge=1, le=20, default=7.5),
         scheduler: str = Input(description="Choose a scheduler", choices=["DDIM", "Euler a", "DPM++ 2M Karras", "DPM++ 3M SDE Karras"], default="DPM++ 3M SDE Karras"),
         seed: int = Input(description="Random seed. Leave blank to randomize the seed", default=None),
-        use_multi_diffusion: bool = Input(description="Use MultiDiffusion for enhancement", default=True),
-        window_size: int = Input(description="Window size for MultiDiffusion", ge=32, le=128, default=64),
-        stride: int = Input(description="Stride for MultiDiffusion", ge=4, le=64, default=8),
+        use_depth_controlnet: bool = Input(description="Use depth ControlNet", default=False),
+        depth_image: Path = Input(description="Input image for depth ControlNet", default=None),
+        controlnet_conditioning_scale: float = Input(description="ControlNet conditioning scale", ge=0.0, le=1.0, default=0.5),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         pipe = self.load_model(model, model_url)
@@ -260,41 +238,48 @@ class Predictor(BasePredictor):
         prompt_embeds = self.compel_proc(prompt)
         negative_prompt_embeds = self.compel_proc(negative_prompt) if negative_prompt else None
 
-        # Generate initial latents
-        latents = torch.randn(
-            (1, pipe.unet.config.in_channels, height // 8, width // 8),
-            generator=generator,
-            device=DEVICE,
-            dtype=torch.float16
-        )
+        if use_depth_controlnet and depth_image:
+            # Load and process the depth image
+            depth_image = Image.open(depth_image).convert("RGB")
+            depth_image = self.depth_detector(depth_image)
+            
+            # Create ControlNet pipeline
+            controlnet_pipe = StableDiffusionControlNetPipeline(
+                vae=pipe.vae,
+                text_encoder=pipe.text_encoder,
+                tokenizer=pipe.tokenizer,
+                unet=pipe.unet,
+                scheduler=pipe.scheduler,
+                safety_checker=pipe.safety_checker,
+                feature_extractor=pipe.feature_extractor,
+                controlnet=self.controlnet_models["depth"]
+            ).to(DEVICE)
 
-        # Apply MultiDiffusion if enabled
-        if use_multi_diffusion:
-            views = self._get_views(height // 8, width // 8, window_size // 8, stride // 8)
-            latents = self._multi_diffusion(pipe, latents, prompt_embeds, negative_prompt_embeds, num_inference_steps, guidance_scale, views)
-        else:
-            # Use standard diffusion process
-            latents = pipe(
+            output = controlnet_pipe(
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
-                height=height,
+                image=depth_image,
                 width=width,
+                height=height,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 num_images_per_prompt=num_outputs,
                 generator=generator,
-                latents=latents,
-                output_type="latent"
-            ).images
-
-        # Decode latents to images
-        images = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
-        images = (images / 2 + 0.5).clamp(0, 1)
-        images = images.cpu().permute(0, 2, 3, 1).float().numpy()
-        images = (images * 255).round().astype("uint8")
-        pil_images = [Image.fromarray(image) for image in images]
-
-        return self._save_output_images(pil_images)
+                controlnet_conditioning_scale=controlnet_conditioning_scale,
+            )
+        else:
+            output = pipe(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                num_images_per_prompt=num_outputs,
+                generator=generator,
+            )
+        
+        return self._save_output_images(output.images)
     
     def _get_scheduler(self, scheduler_name: str, config):
         """Get the specified scheduler."""
