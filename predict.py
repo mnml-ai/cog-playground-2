@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import random
 from diffusers import (
-    StableDiffusionPanoramaPipeline,
+    StableDiffusionPipeline,
     DDIMScheduler,
     EulerAncestralDiscreteScheduler,
     DPMSolverMultistepScheduler,
@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 class Predictor(BasePredictor):
-
     def setup(self):
         """Initialize the predictor."""
         self.model_pipes: Dict[str, Dict] = {}
@@ -72,7 +71,7 @@ class Predictor(BasePredictor):
         model_path = self._download_model(model_url)
         logger.info(f"Loading custom model from {model_path}")
         try:
-            return StableDiffusionPanoramaPipeline.from_single_file(
+            return StableDiffusionPipeline.from_single_file(
                 model_path,
                 torch_dtype=torch.float16,
                 use_safetensors=True,
@@ -99,7 +98,7 @@ class Predictor(BasePredictor):
         model_id, custom_config = model_id_map[model_name]
         
         try:
-            return StableDiffusionPanoramaPipeline.from_pretrained(
+            return StableDiffusionPipeline.from_pretrained(
                 model_id,
                 torch_dtype=torch.float16,
                 use_safetensors=True,
@@ -110,7 +109,7 @@ class Predictor(BasePredictor):
         except Exception as e:
             logger.warning(f"Failed to load with safetensors: {e}")
             logger.info("Attempting to load with PyTorch weights...")
-            return StableDiffusionPanoramaPipeline.from_pretrained(
+            return StableDiffusionPipeline.from_pretrained(
                 model_id,
                 torch_dtype=torch.float16,
                 use_safetensors=False,
@@ -177,6 +176,51 @@ class Predictor(BasePredictor):
         np.random.seed(seed)
         random.seed(seed)
 
+    def _get_views(self, height: int, width: int, window_size: int = 64, stride: int = 8):
+        """Generate views for MultiDiffusion."""
+        views = []
+        for h in range(0, height - window_size + 1, stride):
+            for w in range(0, width - window_size + 1, stride):
+                views.append((h, w, h + window_size, w + window_size))
+        return views
+
+    def _multi_diffusion(self, pipe, latents, prompt_embeds, negative_prompt_embeds, num_inference_steps, guidance_scale, views):
+        """Apply MultiDiffusion technique."""
+        for step in pipe.progress_bar(pipe.scheduler.timesteps):
+            latent_model_input = pipe.scheduler.scale_model_input(latents, step)
+            noise_pred = torch.zeros_like(latents)
+            weights_sum = torch.zeros_like(latents)
+
+            for view in views:
+                h_start, w_start, h_end, w_end = view
+                latent_view = latent_model_input[:, :, h_start:h_end, w_start:w_end]
+                
+                noise_pred_view = pipe.unet(
+                    latent_view,
+                    step,
+                    encoder_hidden_states=prompt_embeds,
+                    cross_attention_kwargs=None,
+                    return_dict=False,
+                )[0]
+
+                if guidance_scale > 1.0:
+                    uncond_noise_pred_view = pipe.unet(
+                        latent_view,
+                        step,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        cross_attention_kwargs=None,
+                        return_dict=False,
+                    )[0]
+                    noise_pred_view = uncond_noise_pred_view + guidance_scale * (noise_pred_view - uncond_noise_pred_view)
+
+                noise_pred[:, :, h_start:h_end, w_start:w_end] += noise_pred_view
+                weights_sum[:, :, h_start:h_end, w_start:w_end] += 1
+
+            noise_pred = noise_pred / weights_sum
+            latents = pipe.scheduler.step(noise_pred, step, latents, return_dict=False)[0]
+
+        return latents
+
     @torch.inference_mode()
     def predict(
         self,
@@ -187,15 +231,16 @@ class Predictor(BasePredictor):
             description="Negative prompt - using compel, use +++ to increase words weight.",
             default="lowres, cropped, worst quality, low quality"
         ),
-        width: int = Input(description="Width of output image", ge=64, le=2048, default=2048),
+        width: int = Input(description="Width of output image", ge=64, le=2048, default=512),
         height: int = Input(description="Height of output image", ge=64, le=2048, default=512),
         num_outputs: int = Input(description="Number of images to output", ge=1, le=4, default=1),
         num_inference_steps: int = Input(description="Number of denoising steps", ge=1, le=100, default=50),
         guidance_scale: float = Input(description="Scale for classifier-free guidance", ge=1, le=20, default=7.5),
         scheduler: str = Input(description="Choose a scheduler", choices=["DDIM", "Euler a", "DPM++ 2M Karras", "DPM++ 3M SDE Karras"], default="DPM++ 3M SDE Karras"),
         seed: int = Input(description="Random seed. Leave blank to randomize the seed", default=None),
-        view_batch_size: int = Input(description="Batch size for denoising split views", ge=1, le=8, default=1),
-        circular_padding: bool = Input(description="Use circular padding for seamless panoramas", default=True),
+        use_multi_diffusion: bool = Input(description="Use MultiDiffusion for enhancement", default=True),
+        window_size: int = Input(description="Window size for MultiDiffusion", ge=32, le=128, default=64),
+        stride: int = Input(description="Stride for MultiDiffusion", ge=4, le=64, default=8),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         pipe = self.load_model(model, model_url)
@@ -215,20 +260,41 @@ class Predictor(BasePredictor):
         prompt_embeds = self.compel_proc(prompt)
         negative_prompt_embeds = self.compel_proc(negative_prompt) if negative_prompt else None
 
-        output = pipe(
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            width=width,
-            height=height,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            num_images_per_prompt=num_outputs,
+        # Generate initial latents
+        latents = torch.randn(
+            (1, pipe.unet.config.in_channels, height // 8, width // 8),
             generator=generator,
-            view_batch_size=view_batch_size,
-            circular_padding=circular_padding,
+            device=DEVICE,
+            dtype=torch.float16
         )
-        
-        return self._save_output_images(output.images)
+
+        # Apply MultiDiffusion if enabled
+        if use_multi_diffusion:
+            views = self._get_views(height // 8, width // 8, window_size // 8, stride // 8)
+            latents = self._multi_diffusion(pipe, latents, prompt_embeds, negative_prompt_embeds, num_inference_steps, guidance_scale, views)
+        else:
+            # Use standard diffusion process
+            latents = pipe(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                num_images_per_prompt=num_outputs,
+                generator=generator,
+                latents=latents,
+                output_type="latent"
+            ).images
+
+        # Decode latents to images
+        images = pipe.vae.decode(latents / pipe.vae.config.scaling_factor, return_dict=False)[0]
+        images = (images / 2 + 0.5).clamp(0, 1)
+        images = images.cpu().permute(0, 2, 3, 1).float().numpy()
+        images = (images * 255).round().astype("uint8")
+        pil_images = [Image.fromarray(image) for image in images]
+
+        return self._save_output_images(pil_images)
     
     def _get_scheduler(self, scheduler_name: str, config):
         """Get the specified scheduler."""

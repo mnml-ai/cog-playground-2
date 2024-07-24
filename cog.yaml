@@ -15,5 +15,6 @@ build:
     - "requests==2.31.0"
     - "omegaconf==2.3.0"
     - "compel==2.0.1"
+    - "Pillow==10.0.1"  # Added explicitly for image processing
 
 predict: "predict.py:Predictor"
